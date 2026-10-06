@@ -1,0 +1,130 @@
+name: Build Maktabah Manager APK
+
+on:
+  push:
+    paths: ['**.zip', '.github/workflows/build-apk.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-build
+  cancel-in-progress: true
+
+env:
+  APP_NAME: Maktabah Manager
+  APP_ID: com.krurdu.maktabah
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Latest added/modified zip (git commit time se)
+      - name: Find latest zip
+        id: zip
+        run: |
+          best=""; bt=-1
+          while IFS= read -r -d '' f; do
+            t=$(git log -1 --format=%ct -- "$f"); t=${t:-0}
+            if [ "$t" -ge "$bt" ]; then bt=$t; best=$f; fi
+          done < <(git ls-files -z '*.zip')
+          [ -z "$best" ] && { echo "::error::Repo me koi .zip nahi mila"; exit 1; }
+          echo "Using: $best"
+          echo "path=$best" >> "$GITHUB_OUTPUT"
+
+      # Extract (index.html wala folder + branding/ auto detect)
+      - name: Extract zip
+        run: |
+          rm -rf src app && mkdir -p src app/www app/assets
+          unzip -q "${{ steps.zip.outputs.path }}" -d src
+          idx=$(find src -path '*/__MACOSX' -prune -o -name index.html -print \
+                | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          [ -z "$idx" ] && { echo "::error::Zip me index.html nahi mila"; exit 1; }
+          web=$(dirname "$idx"); echo "Web folder: $web"
+          cp -a "$web"/. app/www/
+          br=$(find src -path '*/__MACOSX' -prune -o -type d -name branding -print | head -1)
+          [ -n "$br" ] && cp -a "$br"/. app/assets/ || echo "::warning::branding/ nahi mila, default Capacitor icon banega"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Capacitor + Android
+        working-directory: app
+        run: |
+          npm init -y >/dev/null
+          npm i --legacy-peer-deps @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7 \
+            @capacitor/splash-screen@7 @aparajita/capacitor-biometric-auth@9
+          cat > capacitor.config.json <<EOC
+          {
+            "appId": "${APP_ID}",
+            "appName": "${APP_NAME}",
+            "webDir": "www",
+            "server": { "androidScheme": "https" },
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": 1800,
+                "launchAutoHide": true,
+                "backgroundColor": "#0a1f17",
+                "androidScaleType": "CENTER_CROP",
+                "showSpinner": false
+              }
+            }
+          }
+          EOC
+          npx cap add android
+          sed -i 's/android:allowBackup="true"/android:allowBackup="false"/' android/app/src/main/AndroidManifest.xml
+          sed -i "s/versionCode 1/versionCode ${GITHUB_RUN_NUMBER}/; s/versionName \"1.0\"/versionName \"1.${GITHUB_RUN_NUMBER}\"/" android/app/build.gradle
+          if [ -f assets/icon-only.png ]; then
+            npx --yes @capacitor/assets generate --android \
+              --iconBackgroundColor "#0a1f17" --iconBackgroundColorDark "#0a1f17" \
+              --splashBackgroundColor "#0a1f17" --splashBackgroundColorDark "#0a1f17"
+          fi
+          npx cap sync android
+
+      # Keystore secrets ho to signed release, warna debug APK
+      - name: Build APK
+        working-directory: app/android
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          mkdir -p ../../dist
+          OUT="$PWD/../../dist/Maktabah-Manager-build${GITHUB_RUN_NUMBER}.apk"
+          if [ -n "$KS_B64" ]; then
+            ./gradlew assembleRelease --no-daemon
+            echo "$KS_B64" | base64 -d > ../release.jks
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+            "$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk ../aligned.apk
+            export KEY_PASS="${KEY_PASS:-$KS_PASS}"
+            "$BT/apksigner" sign --ks ../release.jks --ks-key-alias "$KS_ALIAS" \
+              --ks-pass env:KS_PASS --key-pass env:KEY_PASS --out "$OUT" ../aligned.apk
+          else
+            ./gradlew assembleDebug --no-daemon
+            cp app/build/outputs/apk/debug/app-debug.apk "$OUT"
+          fi
+          ls -lh ../../dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Maktabah-Manager-APK
+          path: app/dist/*.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Maktabah Manager build ${{ github.run_number }}
+          files: app/dist/*.apk
