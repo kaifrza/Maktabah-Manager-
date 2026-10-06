@@ -5,10 +5,14 @@ on:
     inputs:
       publish_release:
         description: Publish the APK as a GitHub Release
+        required: false
         type: boolean
         default: true
+
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
     paths:
       - "**.zip"
       - "native-android/**"
@@ -24,77 +28,366 @@ permissions:
 env:
   APP_ID: ${{ vars.APP_ID || 'com.krurdu.manager' }}
   APP_NAME: Maktabah Manager
+  ANDROID_API: "35"
+  BUILD_TOOLS: "35.0.0"
+  GRADLE_VERSION: "8.10.2"
 
 jobs:
+
   build:
+
+    name: Build Native Android APK
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+
+      # ============================================================
+      # 2. JAVA 17
+      # ============================================================
+
+      - name: Setup Java 17
+        id: java
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+          cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
 
-      - name: Install SDK
+      - name: Verify Java
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          set -Eeuo pipefail
 
-      - name: Set up Gradle
+          echo "Java version:"
+          java -version
+
+          echo "JAVA_HOME=$JAVA_HOME"
+
+
+      # ============================================================
+      # 3. ANDROID SDK
+      #
+      # IMPORTANT:
+      # setup-android v4 does NOT request the deprecated
+      # "tools" package.
+      # ============================================================
+
+      - name: Setup Android SDK
+        id: android_sdk
+        continue-on-error: true
+        uses: android-actions/setup-android@v4.0.4
+        with:
+          packages: "platform-tools"
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+
+      # ============================================================
+      # 4. ANDROID SDK FAILURE DIAGNOSTICS
+      # ============================================================
+
+      - name: Diagnose Android SDK setup failure
+        if: steps.android_sdk.outcome == 'failure'
+        run: |
+          {
+            echo "## ❌ Android SDK setup failed"
+            echo
+            echo "**Stage:** Setup Android SDK"
+            echo
+            echo "**Likely cause:** The Android SDK setup action failed before the Gradle build started."
+            echo
+            echo "The full action log remains above this summary, but this section is the short failure report."
+            echo
+            echo "**Environment:**"
+            echo "- Runner: $RUNNER_OS"
+            echo "- Android API: $ANDROID_API"
+            echo "- Build Tools: $BUILD_TOOLS"
+            echo
+            echo "**Next action:** Check the last error lines of the `Setup Android SDK` step."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "============================================================"
+          echo "ANDROID SDK SETUP FAILED"
+          echo "============================================================"
+          echo "Runner:        $RUNNER_OS"
+          echo "Android API:   $ANDROID_API"
+          echo "Build Tools:   $BUILD_TOOLS"
+          echo "============================================================"
+
+          exit 1
+
+
+      # ============================================================
+      # 5. INSTALL REQUIRED SDK COMPONENTS
+      # ============================================================
+
+      - name: Install Android SDK components
+        id: sdk_components
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LOG_FILE="$RUNNER_TEMP/android-sdk-install.log"
+
+          trap '
+            STATUS=$?
+            if [ "$STATUS" -ne 0 ]; then
+              {
+                echo "## ❌ Android SDK component installation failed"
+                echo
+                echo "**Stage:** Install Android SDK components"
+                echo
+                echo "**Requested packages:**"
+                echo "- platform-tools"
+                echo "- platforms;android-${ANDROID_API}"
+                echo "- build-tools;${BUILD_TOOLS}"
+                echo
+                echo "**Exit code:** ${STATUS}"
+                echo
+                echo "### Last 30 log lines"
+                echo "\`\`\`text"
+                tail -30 "$LOG_FILE" || true
+                echo "\`\`\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+
+              echo
+              echo "============================================================"
+              echo "ANDROID SDK COMPONENT INSTALLATION FAILED"
+              echo "============================================================"
+              echo "Last 30 lines:"
+              tail -30 "$LOG_FILE" || true
+              echo "============================================================"
+            fi
+
+            exit "$STATUS"
+          ' ERR
+
+          echo "Installing Android SDK components..."
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS}" \
+            2>&1 | tee "$LOG_FILE"
+
+
+      # ============================================================
+      # 6. SDK COMPONENT FAILURE GATE
+      # ============================================================
+
+      - name: Stop if SDK components failed
+        if: steps.sdk_components.outcome == 'failure'
+        run: |
+          echo "Android SDK component installation failed."
+          exit 1
+
+
+      # ============================================================
+      # 7. VERIFY ANDROID SDK
+      # ============================================================
+
+      - name: Verify Android SDK
+        id: verify_sdk
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LOG_FILE="$RUNNER_TEMP/android-sdk-verify.log"
+
+          trap '
+            STATUS=$?
+            if [ "$STATUS" -ne 0 ]; then
+              {
+                echo "## ❌ Android SDK verification failed"
+                echo
+                echo "**Stage:** Verify Android SDK"
+                echo
+                echo "### SDK location"
+                echo "\`${ANDROID_SDK_ROOT:-${ANDROID_HOME:-unknown}}\`"
+                echo
+                echo "### Installed packages"
+                echo "\`\`\`text"
+                sdkmanager --list_installed 2>&1 | tail -80 || true
+                echo "\`\`\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+
+            exit "$STATUS"
+          ' ERR
+
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+
+          echo
+          echo "sdkmanager:"
+          command -v sdkmanager
+          sdkmanager --version
+
+          echo
+          echo "adb:"
+          command -v adb
+          adb version
+
+          echo
+          echo "Android platform:"
+          test -d "$ANDROID_SDK_ROOT/platforms/android-${ANDROID_API}"
+
+          echo
+          echo "Build tools:"
+          test -d "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+
+          echo
+          echo "Android SDK verification PASSED."
+
+
+      # ============================================================
+      # 8. SDK VERIFICATION FAILURE GATE
+      # ============================================================
+
+      - name: Stop if SDK verification failed
+        if: steps.verify_sdk.outcome == 'failure'
+        run: |
+          echo "Android SDK verification failed."
+          exit 1
+
+
+      # ============================================================
+      # 9. GRADLE
+      # ============================================================
+
+      - name: Setup Gradle
+        id: gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.10.2'
+          gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Extract latest Manager source
+
+      # ============================================================
+      # 10. EXTRACT MANAGER SOURCE
+      # ============================================================
+
+      - name: Extract Manager source
+        id: extract
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           rm -rf _src _app
-          mkdir _src
+          mkdir -p _src
 
-          ZIP=$(find . -type f -name 'KR_Urdu_Library_Manager_*.zip' \
-            -not -path './_src/*' | sort | tail -1)
+          ZIP="$(
+            find . \
+              -type f \
+              -name 'KR_Urdu_Library_Manager_*.zip' \
+              -not -path './_src/*' \
+              | sort \
+              | tail -1
+          )"
 
-          test -n "$ZIP"
+          if [ -z "$ZIP" ]; then
+            {
+              echo "## ❌ Manager ZIP not found"
+              echo
+              echo "Expected a file matching:"
+              echo "\`KR_Urdu_Library_Manager_*.zip\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "ERROR: Manager ZIP not found."
+            exit 1
+          fi
+
+          echo "Using:"
+          echo "$ZIP"
 
           unzip -q "$ZIP" -d _src
 
-          IDX=$(find _src \
-            -path '*/manager/index.html' \
-            -not -path '*/node_modules/*' | head -1)
+          IDX="$(
+            find _src \
+              -type f \
+              -path '*/manager/index.html' \
+              -not -path '*/node_modules/*' \
+              | head -1
+          )"
 
-          test -n "$IDX"
+          if [ -z "$IDX" ]; then
+            {
+              echo "## ❌ Manager source structure invalid"
+              echo
+              echo "Could not find:"
+              echo "\`manager/index.html\`"
+            } >> "$GITHUB_STEP_SUMMARY"
 
-          SRC_ROOT=$(dirname "$(dirname "$IDX")")
+            echo "ERROR: manager/index.html not found."
+            exit 1
+          fi
+
+          SRC_ROOT="$(dirname "$(dirname "$IDX")")"
+
           echo "SRC_ROOT=$SRC_ROOT" >> "$GITHUB_ENV"
 
-      - name: Prepare native project
+          echo "Manager source:"
+          echo "$SRC_ROOT"
+
+
+      # ============================================================
+      # 11. PREPARE NATIVE ANDROID PROJECT
+      # ============================================================
+
+      - name: Prepare native Android project
+        id: prepare
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           cp -R native-android _app
 
-          mkdir -p _app/app/src/main/assets/www
+          mkdir -p \
+            _app/app/src/main/assets/www
+
+          # Copy Manager web application.
+          # Keep Supabase folder excluded because the native
+          # application does not need SQL patch files as assets.
 
           rsync -a \
             --exclude 'supabase' \
             "$SRC_ROOT/manager/" \
             _app/app/src/main/assets/www/
 
+
+          # --------------------------------------------------------
+          # Replace application ID
+          # --------------------------------------------------------
+
           sed -i \
             "s/__APP_ID__/$APP_ID/g" \
             _app/app/build.gradle.kts \
             _app/app/src/main/AndroidManifest.xml
 
-          PKG_PATH=$(echo "$APP_ID" | tr . /)
 
-          mkdir -p "_app/app/src/main/java/$PKG_PATH"
+          # --------------------------------------------------------
+          # Move MainActivity into the configured package
+          # --------------------------------------------------------
+
+          PKG_PATH="$(echo "$APP_ID" | tr '.' '/')"
+
+          mkdir -p \
+            "_app/app/src/main/java/$PKG_PATH"
 
           mv \
             _app/app/src/main/java/com/krurdu/manager/MainActivity.kt \
@@ -104,64 +397,187 @@ jobs:
             "s/^package com\.krurdu\.manager/package $APP_ID/" \
             "_app/app/src/main/java/$PKG_PATH/MainActivity.kt"
 
+
+          echo
+          echo "Prepared application:"
+          echo "APP_ID=$APP_ID"
+          echo "PACKAGE_PATH=$PKG_PATH"
+
+
+      # ============================================================
+      # 12. GENERATE GRADLE WRAPPER
+      # ============================================================
+
       - name: Generate Gradle wrapper
+        id: wrapper
         working-directory: _app
+        shell: bash
         run: |
+          set -Eeuo pipefail
+
           gradle wrapper \
-            --gradle-version 8.10.2 \
+            --gradle-version "$GRADLE_VERSION" \
             --distribution-type bin
 
-      - name: Static verification
-        working-directory: _app
+          test -f gradlew
+          chmod +x gradlew
+
+
+      # ============================================================
+      # 13. STATIC PROJECT VERIFICATION
+      # ============================================================
+
+      - name: Static project verification
+        id: static_check
+        shell: bash
         run: |
-          grep -q 'USE_BIOMETRIC' \
-            app/src/main/AndroidManifest.xml
+          set -Eeuo pipefail
 
-          grep -q 'BiometricPrompt' \
-            app/src/main/java/*/*/*/*/MainActivity.kt
+          APP_DIR="_app"
 
-          grep -q 'installSplashScreen' \
-            app/src/main/java/*/*/*/*/MainActivity.kt
+          MANIFEST="$APP_DIR/app/src/main/AndroidManifest.xml"
+          ACTIVITY="$(
+            find "$APP_DIR/app/src/main/java" \
+              -type f \
+              -name 'MainActivity.kt' \
+              | head -1
+          )"
 
-          grep -q 'androidBridge' \
-            app/src/main/assets/www/applock.js
+          WEB_DIR="$APP_DIR/app/src/main/assets/www"
 
-          grep -q 'androidBridge' \
-            app/src/main/assets/www/native-shell.js
+          test -f "$MANIFEST"
+          test -n "$ACTIVITY"
 
-          test -f \
-            app/src/main/assets/www/native-splash.png
+          echo "MainActivity:"
+          echo "$ACTIVITY"
 
-          test -f \
-            app/src/main/res/drawable/mk_splash.png
+          echo
+          echo "Checking biometric permission..."
+          grep -q 'USE_BIOMETRIC' "$MANIFEST"
 
-          test -f \
-            app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          echo "Checking BiometricPrompt..."
+          grep -q 'BiometricPrompt' "$ACTIVITY"
 
-          node --check \
-            app/src/main/assets/www/applock.js
+          echo "Checking SplashScreen..."
+          grep -q 'installSplashScreen' "$ACTIVITY"
 
-          node --check \
-            app/src/main/assets/www/native-shell.js
+          echo "Checking Android bridge..."
+          grep -q 'androidBridge' "$WEB_DIR/applock.js"
+          grep -q 'androidBridge' "$WEB_DIR/native-shell.js"
 
-      - name: Build debug APK
+          echo "Checking native splash..."
+          test -f "$WEB_DIR/native-splash.png"
+
+          echo "Checking native icon..."
+          test -f "$APP_DIR/app/src/main/res/drawable/mk_icon.png"
+
+          echo "Checking native splash resource..."
+          test -f "$APP_DIR/app/src/main/res/drawable/mk_splash.png"
+
+          echo "Checking launcher icon..."
+          test -f "$APP_DIR/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+
+          echo "Checking JavaScript syntax..."
+          node --check "$WEB_DIR/applock.js"
+          node --check "$WEB_DIR/native-shell.js"
+
+          echo
+          echo "Static verification PASSED."
+
+
+      # ============================================================
+      # 14. BUILD APK
+      # ============================================================
+
+      - name: Build Debug APK
+        id: build_apk
         working-directory: _app
+        continue-on-error: true
+        shell: bash
         run: |
-          ./gradlew assembleDebug \
+          set -o pipefail
+
+          LOG_FILE="$RUNNER_TEMP/gradle-build.log"
+
+          echo "Starting Gradle build..."
+
+          ./gradlew \
+            assembleDebug \
             --no-daemon \
-            --stacktrace
+            --stacktrace \
+            2>&1 | tee "$LOG_FILE"
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            {
+              echo "## ❌ Gradle APK build failed"
+              echo
+              echo "**Stage:** Gradle / assembleDebug"
+              echo
+              echo "**Exit code:** $EXIT_CODE"
+              echo
+              echo "### Last 40 Gradle lines"
+              echo "\`\`\`text"
+              tail -40 "$LOG_FILE"
+              echo "\`\`\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit "$EXIT_CODE"
+          fi
+
+
+      # ============================================================
+      # 15. BUILD FAILURE GATE
+      # ============================================================
+
+      - name: Stop if APK build failed
+        if: steps.build_apk.outcome == 'failure'
+        run: |
+          echo "APK build failed."
+          exit 1
+
+
+      # ============================================================
+      # 16. APK VERIFICATION
+      # ============================================================
 
       - name: Verify APK
+        id: verify_apk
+        shell: bash
         run: |
-          APK=$(find \
-            _app/app/build/outputs/apk/debug \
-            -name '*.apk' | head -1)
+          set -Eeuo pipefail
 
-          test -n "$APK"
+          APK="$(
+            find _app/app/build/outputs/apk/debug \
+              -type f \
+              -name '*.apk' \
+              | head -1
+          )"
 
-          AAPT=$(find \
-            "$ANDROID_HOME/build-tools" \
-            -name aapt | sort -V | tail -1)
+          if [ -z "$APK" ]; then
+            {
+              echo "## ❌ APK not found"
+              echo
+              echo "Gradle completed but no APK was found."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "ERROR: APK not found."
+            exit 1
+          fi
+
+          echo "APK:"
+          echo "$APK"
+
+          AAPT="$(
+            find "$ANDROID_SDK_ROOT/build-tools" \
+              -type f \
+              -name aapt \
+              | sort -V \
+              | tail -1
+          )"
+
+          test -n "$AAPT"
 
           "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
 
@@ -173,11 +589,16 @@ jobs:
             "application-label:'Maktabah Manager'" \
             /tmp/badging.txt
 
-          unzip -l "$APK" | \
-            grep -q 'assets/www/applock.js'
+          unzip -l "$APK" \
+            | grep -q 'assets/www/applock.js'
 
-          unzip -l "$APK" | \
-            grep -q 'assets/www/native-shell.js'
+          unzip -l "$APK" \
+            | grep -q 'assets/www/native-shell.js'
+
+
+          # --------------------------------------------------------
+          # Copy final APK
+          # --------------------------------------------------------
 
           mkdir -p dist
 
@@ -185,27 +606,65 @@ jobs:
 
           cp "$APK" "dist/$OUT"
 
+          SHA256="$(
+            sha256sum "dist/$OUT" \
+            | cut -d' ' -f1
+          )"
+
           echo "APK_FILE=dist/$OUT" >> "$GITHUB_ENV"
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
+          echo "APK_SHA=$SHA256" >> "$GITHUB_ENV"
 
-          echo "APK_SHA=$(sha256sum "dist/$OUT" | cut -d' ' -f1)" \
-            >> "$GITHUB_ENV"
+
+          {
+            echo "## ✅ APK verification passed"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Package | \`$APP_ID\` |"
+            echo "| App name | \`Maktabah Manager\` |"
+            echo "| Android API | \`$ANDROID_API\` |"
+            echo "| Build Tools | \`$BUILD_TOOLS\` |"
+            echo "| APK | \`$OUT\` |"
+            echo "| SHA-256 | \`$SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      # ============================================================
+      # 17. UPLOAD ARTIFACT
+      # ============================================================
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APK_NAME }}
           path: ${{ env.APK_FILE }}
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Publish release
-        if: github.event_name == 'push' || inputs.publish_release
+
+      # ============================================================
+      # 18. GITHUB RELEASE
+      # ============================================================
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' || inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
           tag_name: manager-native-build-${{ github.run_number }}
           name: Maktabah Manager Native v1.0.${{ github.run_number }}
           body: |
+            ## Maktabah Manager Native Android
+
             Native Kotlin Android build.
-            SHA-256: ${{ env.APK_SHA }}
+
+            **Package:** ${{ env.APP_ID }}
+
+            **Android API:** ${{ env.ANDROID_API }}
+
+            **Build Tools:** ${{ env.BUILD_TOOLS }}
+
+            **SHA-256:**
+            ${{ env.APK_SHA }}
           files: ${{ env.APK_FILE }}
           make_latest: true
