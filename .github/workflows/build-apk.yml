@@ -1,20 +1,21 @@
-name: Build Maktabah Manager APK
+name: Build Maktabah Manager Native APK
 
 on:
   workflow_dispatch:
     inputs:
       publish_release:
-        description: "Publish the APK as a GitHub Release (direct download on phone)"
+        description: Publish the APK as a GitHub Release
         type: boolean
         default: true
   push:
     branches: [main, master]
     paths:
       - "**.zip"
+      - "native-android/**"
       - ".github/workflows/build-apk.yml"
 
 concurrency:
-  group: manager-apk-${{ github.ref }}
+  group: manager-native-apk-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -23,12 +24,11 @@ permissions:
 env:
   APP_ID: ${{ vars.APP_ID || 'com.krurdu.manager' }}
   APP_NAME: Maktabah Manager
-  CAP_MAJOR: "7"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -36,286 +36,160 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Pick the latest zip
-        run: |
-          python3 - <<'PY'
-          import glob, os, re, subprocess, sys
-          zips = [z for z in glob.glob("**/*.zip", recursive=True)
-                  if not z.startswith(("_src", "_app", "node_modules", "."))]
-          if not zips:
-              sys.exit("No .zip found in the repository.")
-          def key(z):
-              t = subprocess.run(["git", "log", "-1", "--format=%ct", "--", z],
-                                 capture_output=True, text=True).stdout.strip()
-              nat = [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", os.path.basename(z).lower())]
-              return (int(t or 0), nat)
-          zips.sort(key=key, reverse=True)
-          print("Zips found:", *zips, sep="\n  ")
-          print("Using:", zips[0])
-          open(os.environ["GITHUB_ENV"], "a").write(f"ZIP_FILE={zips[0]}\n")
-          PY
-
-      - name: Extract the project
-        run: |
-          rm -rf _src && mkdir _src
-          unzip -q "$ZIP_FILE" -d _src
-          IDX=$(find _src -path '*/manager/index.html' -not -path '*/node_modules/*' | head -1)
-          [ -n "$IDX" ] || { echo "manager/index.html not found inside $ZIP_FILE"; exit 1; }
-          SRC_ROOT=$(dirname "$(dirname "$IDX")")
-          echo "SRC_ROOT=$SRC_ROOT" >> "$GITHUB_ENV"
-          echo "Project root: $SRC_ROOT"
-          ls "$SRC_ROOT"
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Set up Java 21
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-
-      - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
-
-      - name: Create Capacitor project
-        run: |
-          mkdir -p _app/www && cd _app
-          npm init -y > /dev/null
-          npm i --no-audit --no-fund \
-            @capacitor/core@$CAP_MAJOR @capacitor/cli@$CAP_MAJOR @capacitor/android@$CAP_MAJOR \
-            @capacitor/app@$CAP_MAJOR @capacitor/splash-screen@$CAP_MAJOR semver
-          npm i -D --no-audit --no-fund @capacitor/assets
-          rsync -a --exclude 'supabase' "../$SRC_ROOT/manager/" www/
-          test -f www/index.html
-
-      - name: Add biometric plugin (version matched to Capacitor)
-        working-directory: _app
-        run: |
-          BIO_VER=$(node -e '
-            const { execSync } = require("child_process");
-            const semver = require("semver");
-            const pkg = "@aparajita/capacitor-biometric-auth";
-            const major = process.env.CAP_MAJOR;
-            const all = JSON.parse(execSync(`npm view ${pkg} versions --json`).toString())
-              .filter(v => !v.includes("-")).reverse();
-            let pick = "";
-            for (const v of all.slice(0, 30)) {
-              try {
-                const peer = JSON.parse(execSync(`npm view ${pkg}@${v} peerDependencies --json`).toString() || "{}");
-                const r = peer["@capacitor/core"];
-                if (r && (semver.satisfies(major + ".0.0", r) || semver.satisfies(major + ".9.0", r))) { pick = v; break; }
-              } catch (e) {}
-            }
-            process.stdout.write(pick || "latest");
-          ')
-          echo "Biometric plugin version: $BIO_VER"
-          npm i --no-audit --no-fund "@aparajita/capacitor-biometric-auth@$BIO_VER"
-
-      - name: Capacitor config and Android platform
-        working-directory: _app
-        run: |
-          cat > capacitor.config.json <<EOF
-          {
-            "appId": "$APP_ID",
-            "appName": "$APP_NAME",
-            "webDir": "www",
-            "backgroundColor": "#0a1a14",
-            "android": { "allowMixedContent": false },
-            "plugins": {
-              "SplashScreen": {
-                "launchShowDuration": 1600,
-                "launchAutoHide": true,
-                "launchFadeOutDuration": 350,
-                "backgroundColor": "#0a1a14",
-                "androidScaleType": "CENTER_CROP",
-                "showSpinner": false
-              }
-            }
-          }
-          EOF
-          npx cap add android
-
-      - name: Generate icon and splash from branding/
-        working-directory: _app
-        run: |
-          if [ -d "../$SRC_ROOT/branding" ]; then
-            mkdir -p assets
-            cp ../$SRC_ROOT/branding/*.png assets/
-            ls -la assets
-            npx capacitor-assets generate --android
-            ls android/app/src/main/res | grep -E 'mipmap|drawable' | head -30
-            ls android/app/src/main/res/mipmap-xxxhdpi/
-          else
-            echo "No branding/ folder in the zip - keeping the default icon."
-          fi
-
-      - name: Native patches (status bar, biometric permission, version, splash)
-        working-directory: _app
-        run: |
-          python3 - <<'PY'
-          import glob, os, re
-          run = os.environ.get("GITHUB_RUN_NUMBER", "1")
-          app = "android/app"
-
-          # ---- MainActivity: edge-to-edge + real insets for the web layer
-          main = glob.glob(app + "/src/main/java/**/MainActivity.java", recursive=True)[0]
-          pkg = re.search(r"^package\s+([\w.]+);", open(main).read(), re.M).group(1)
-          java = '''package __PKG__;
-
-          import android.graphics.Color;
-          import android.os.Build;
-          import android.os.Bundle;
-          import android.view.View;
-          import android.view.Window;
-          import android.view.WindowManager;
-          import android.webkit.JavascriptInterface;
-          import android.webkit.WebView;
-
-          import androidx.core.graphics.Insets;
-          import androidx.core.view.ViewCompat;
-          import androidx.core.view.WindowCompat;
-          import androidx.core.view.WindowInsetsCompat;
-          import androidx.core.view.WindowInsetsControllerCompat;
-
-          import com.getcapacitor.BridgeActivity;
-
-          public class MainActivity extends BridgeActivity {
-            private volatile float topDp = 0f;
-            private volatile float bottomDp = 0f;
-
-            @Override
-            public void onCreate(Bundle savedInstanceState) {
-              super.onCreate(savedInstanceState);
-              final Window window = getWindow();
-              WindowCompat.setDecorFitsSystemWindows(window, false);
-              window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-              window.setStatusBarColor(Color.TRANSPARENT);
-              window.setNavigationBarColor(Color.TRANSPARENT);
-              if (Build.VERSION.SDK_INT >= 29) {
-                window.setNavigationBarContrastEnforced(false);
-                window.setStatusBarContrastEnforced(false);
-              }
-
-              final WebView webView = getBridge().getWebView();
-              webView.addJavascriptInterface(new InsetsBridge(), "KRInsets");
-
-              final View content = findViewById(android.R.id.content);
-              ViewCompat.setOnApplyWindowInsetsListener(content, (v, insets) -> {
-                Insets bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
-                Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
-                boolean imeOn = insets.isVisible(WindowInsetsCompat.Type.ime());
-                float density = getResources().getDisplayMetrics().density;
-                topDp = bars.top / density;
-                bottomDp = imeOn ? 0f : bars.bottom / density;
-                v.setPadding(0, 0, 0, imeOn ? ime.bottom : 0);
-                final String js = "window.__krInsets&&window.__krInsets(" + topDp + "," + bottomDp + ")";
-                webView.post(() -> webView.evaluateJavascript(js, null));
-                return WindowInsetsCompat.CONSUMED;
-              });
-              ViewCompat.requestApplyInsets(content);
-            }
-
-            public class InsetsBridge {
-              @JavascriptInterface
-              public float top() { return topDp; }
-
-              @JavascriptInterface
-              public float bottom() { return bottomDp; }
-
-              @JavascriptInterface
-              public void setDark(final boolean dark) {
-                runOnUiThread(() -> {
-                  WindowInsetsControllerCompat c = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
-                  c.setAppearanceLightStatusBars(!dark);
-                  c.setAppearanceLightNavigationBars(!dark);
-                });
-              }
-            }
-          }
-          '''
-          import textwrap
-          open(main, "w").write(textwrap.dedent(java).replace("__PKG__", pkg))
-          print("MainActivity written for package", pkg)
-
-          # ---- Manifest: biometric permission
-          mf = app + "/src/main/AndroidManifest.xml"
-          m = open(mf).read()
-          if "USE_BIOMETRIC" not in m:
-              m = m.replace("<application", '<uses-permission android:name="android.permission.USE_BIOMETRIC" />\n    <application', 1)
-              open(mf, "w").write(m)
-
-          # ---- Version
-          for gf in (app + "/build.gradle", app + "/build.gradle.kts"):
-              if os.path.exists(gf):
-                  g = open(gf).read()
-                  g = re.sub(r"(versionCode\s*=?\s*)\d+", lambda x: x.group(1) + run, g, 1)
-                  g = re.sub(r'(versionName\s*=?\s*)"[^"]*"', lambda x: x.group(1) + '"1.0.' + run + '"', g, 1)
-                  open(gf, "w").write(g)
-
-          # ---- Android 12+ system splash in brand colours (only when the theme supports it)
-          st = app + "/src/main/res/values/styles.xml"
-          fg = glob.glob(app + "/src/main/res/mipmap-*/ic_launcher_foreground.png")
-          if os.path.exists(st) and fg:
-              s = open(st).read()
-              mt = re.search(r'<style name="AppTheme\.NoActionBarLaunch"[^>]*parent="[^"]*Theme\.SplashScreen[^"]*"[^>]*>', s)
-              if mt and "windowSplashScreenBackground" not in s:
-                  s = s.replace(mt.group(0), mt.group(0) + '\n        <item name="windowSplashScreenBackground">@color/mk_splash_bg</item>\n        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>', 1)
-                  open(st, "w").write(s)
-                  open(app + "/src/main/res/values/mk_colors.xml", "w").write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="mk_splash_bg">#0A3A2B</color>\n</resources>\n')
-                  print("System splash themed.")
-          PY
-
-      - name: Sync Capacitor
-        working-directory: _app
-        run: |
-          npx cap sync android
-          echo "--- native plugins ---"
-          cat android/app/src/main/assets/capacitor.plugins.json
-          grep -q "BiometricAuthNative\|BiometricAuth" android/app/src/main/assets/capacitor.plugins.json \
-            || { echo "Biometric plugin missing from the Android project"; exit 1; }
-
-      - name: Stable signing key (cached)
-        id: keystore
-        uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
-          key: manager-debug-keystore-v1
+          gradle-version: '8.10.2'
 
-      - name: Create signing key if missing
+      - name: Extract latest Manager source
         run: |
-          mkdir -p ~/.android
-          if [ ! -f ~/.android/debug.keystore ]; then
-            keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android \
-              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Android Debug,O=Android,C=US"
-          fi
+          rm -rf _src _app
+          mkdir _src
 
-      - name: Build APK
-        working-directory: _app/android
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ZIP=$(find . -type f -name 'KR_Urdu_Library_Manager_*.zip' \
+            -not -path './_src/*' | sort | tail -1)
 
-      - name: Verify and name the APK
+          test -n "$ZIP"
+
+          unzip -q "$ZIP" -d _src
+
+          IDX=$(find _src \
+            -path '*/manager/index.html' \
+            -not -path '*/node_modules/*' | head -1)
+
+          test -n "$IDX"
+
+          SRC_ROOT=$(dirname "$(dirname "$IDX")")
+          echo "SRC_ROOT=$SRC_ROOT" >> "$GITHUB_ENV"
+
+      - name: Prepare native project
         run: |
-          APK=$(find _app/android/app/build/outputs/apk/debug -name '*.apk' | head -1)
-          [ -n "$APK" ] || { echo "APK not found"; exit 1; }
-          AAPT=$(find "$ANDROID_HOME/build-tools" -name aapt | sort | tail -1)
-          "$AAPT" dump badging "$APK" | grep -E "^package:|application-label:|uses-permission: name='android.permission.USE_BIOMETRIC'"
-          unzip -p "$APK" assets/public/applock.js | grep -q "bioask" || { echo "applock.js not packaged"; exit 1; }
-          unzip -p "$APK" assets/public/native-shell.js | grep -q "KRInsets" || { echo "native-shell.js not packaged"; exit 1; }
-          OUT="Maktabah-Manager-v1.0.${GITHUB_RUN_NUMBER}.apk"
-          mkdir -p dist && cp "$APK" "dist/$OUT"
+          cp -R native-android _app
+
+          mkdir -p _app/app/src/main/assets/www
+
+          rsync -a \
+            --exclude 'supabase' \
+            "$SRC_ROOT/manager/" \
+            _app/app/src/main/assets/www/
+
+          sed -i \
+            "s/__APP_ID__/$APP_ID/g" \
+            _app/app/build.gradle.kts \
+            _app/app/src/main/AndroidManifest.xml
+
+          PKG_PATH=$(echo "$APP_ID" | tr . /)
+
+          mkdir -p "_app/app/src/main/java/$PKG_PATH"
+
+          mv \
+            _app/app/src/main/java/com/krurdu/manager/MainActivity.kt \
+            "_app/app/src/main/java/$PKG_PATH/MainActivity.kt"
+
+          sed -i \
+            "s/^package com\.krurdu\.manager/package $APP_ID/" \
+            "_app/app/src/main/java/$PKG_PATH/MainActivity.kt"
+
+      - name: Generate Gradle wrapper
+        working-directory: _app
+        run: |
+          gradle wrapper \
+            --gradle-version 8.10.2 \
+            --distribution-type bin
+
+      - name: Static verification
+        working-directory: _app
+        run: |
+          grep -q 'USE_BIOMETRIC' \
+            app/src/main/AndroidManifest.xml
+
+          grep -q 'BiometricPrompt' \
+            app/src/main/java/*/*/*/*/MainActivity.kt
+
+          grep -q 'installSplashScreen' \
+            app/src/main/java/*/*/*/*/MainActivity.kt
+
+          grep -q 'androidBridge' \
+            app/src/main/assets/www/applock.js
+
+          grep -q 'androidBridge' \
+            app/src/main/assets/www/native-shell.js
+
+          test -f \
+            app/src/main/assets/www/native-splash.png
+
+          test -f \
+            app/src/main/res/drawable/mk_splash.png
+
+          test -f \
+            app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+          node --check \
+            app/src/main/assets/www/applock.js
+
+          node --check \
+            app/src/main/assets/www/native-shell.js
+
+      - name: Build debug APK
+        working-directory: _app
+        run: |
+          ./gradlew assembleDebug \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify APK
+        run: |
+          APK=$(find \
+            _app/app/build/outputs/apk/debug \
+            -name '*.apk' | head -1)
+
+          test -n "$APK"
+
+          AAPT=$(find \
+            "$ANDROID_HOME/build-tools" \
+            -name aapt | sort -V | tail -1)
+
+          "$AAPT" dump badging "$APK" | tee /tmp/badging.txt
+
+          grep -q \
+            "package: name='$APP_ID'" \
+            /tmp/badging.txt
+
+          grep -q \
+            "application-label:'Maktabah Manager'" \
+            /tmp/badging.txt
+
+          unzip -l "$APK" | \
+            grep -q 'assets/www/applock.js'
+
+          unzip -l "$APK" | \
+            grep -q 'assets/www/native-shell.js'
+
+          mkdir -p dist
+
+          OUT="Maktabah-Manager-native-v1.0.${GITHUB_RUN_NUMBER}.apk"
+
+          cp "$APK" "dist/$OUT"
+
           echo "APK_FILE=dist/$OUT" >> "$GITHUB_ENV"
           echo "APK_NAME=$OUT" >> "$GITHUB_ENV"
-          echo "APK_SHA=$(sha256sum "dist/$OUT" | cut -d' ' -f1)" >> "$GITHUB_ENV"
-          ls -la dist
+
+          echo "APK_SHA=$(sha256sum "dist/$OUT" | cut -d' ' -f1)" \
+            >> "$GITHUB_ENV"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -328,10 +202,10 @@ jobs:
         if: github.event_name == 'push' || inputs.publish_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: manager-build-${{ github.run_number }}
-          name: Maktabah Manager v1.0.${{ github.run_number }}
+          tag_name: manager-native-build-${{ github.run_number }}
+          name: Maktabah Manager Native v1.0.${{ github.run_number }}
           body: |
-            Built from `${{ env.ZIP_FILE }}`
-            SHA-256: `${{ env.APK_SHA }}`
+            Native Kotlin Android build.
+            SHA-256: ${{ env.APK_SHA }}
           files: ${{ env.APK_FILE }}
           make_latest: true
